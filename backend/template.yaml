@@ -1,0 +1,640 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Multi-Player Fantasy Football/Tipping Competition Platform - Serverless Backend + Frontend Hosting
+
+Globals:
+  Function:
+    Timeout: 30
+    MemorySize: 512
+    Runtime: python3.12
+    Tracing: Active
+    Environment:
+      Variables:
+        TABLE_NAME: !Ref CompetitionTable
+        POWERTOOLS_SERVICE_NAME: multi-player
+        POWERTOOLS_LOG_LEVEL: INFO
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Environment name
+  
+  CognitoDomain:
+    Type: String
+    Description: Cognito domain prefix (must be globally unique)
+    Default: multi-player-competition
+
+Conditions:
+  IsProd: !Equals [!Ref Environment, prod]
+
+Resources:
+  # ============================================================================
+  # COGNITO USER POOL & IDENTITY POOL
+  # ============================================================================
+  
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub 'multi-player-${Environment}'
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+      AutoVerifiedAttributes:
+        - email
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: false
+        - Name: name
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+        - Name: preferred_username
+          AttributeDataType: String
+          Mutable: true
+      MfaConfiguration: OPTIONAL
+      EnabledMfas:
+        - SOFTWARE_TOKEN_MFA
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub 'multi-player-web-${Environment}'
+      GenerateSecret: false
+      AllowedOAuthFlows:
+        - code
+        - implicit
+      AllowedOAuthScopes:
+        - email
+        - openid
+        - profile
+      AllowedOAuthFlowsUserPoolClient: true
+      CallbackURLs:
+        - !If [IsProd, 'https://yourdomain.com/callback', 'http://localhost:5173/callback']
+      LogoutURLs:
+        - !If [IsProd, 'https://yourdomain.com/logout', 'http://localhost:5173/logout']
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub '${CognitoDomain}-${Environment}'
+      UserPoolId: !Ref UserPool
+
+  IdentityPool:
+    Type: AWS::Cognito::IdentityPool
+    Properties:
+      IdentityPoolName: !Sub 'multi-player-${Environment}'
+      AllowUnauthenticatedIdentities: false
+      CognitoIdentityProviders:
+        - ClientId: !Ref UserPoolClient
+          ProviderName: !GetAtt UserPool.ProviderName
+
+  # ============================================================================
+  # DYNAMODB TABLE (Single-Table Design)
+  # ============================================================================
+  
+  CompetitionTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'multi-player-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+        - AttributeName: GSI1PK
+          AttributeType: S
+        - AttributeName: GSI1SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: GSI1
+          KeySchema:
+            - AttributeName: GSI1PK
+              KeyType: HASH
+            - AttributeName: GSI1SK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: multi-player
+
+  # ============================================================================
+  # LAMBDA LAYER (Shared Code & Dependencies)
+  # ============================================================================
+  
+  CommonLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub 'multi-player-common-${Environment}'
+      Description: Shared code, models, and dependencies
+      ContentUri: src/layers/common
+      CompatibleRuntimes:
+        - python3.12
+      RetentionPolicy: Delete
+
+  # ============================================================================
+  # API GATEWAY
+  # ============================================================================
+  
+  ApiGateway:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      Name: !Sub 'multi-player-api-${Environment}'
+      StageName: !Ref Environment
+      Auth:
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt UserPool.Arn
+            Identity:
+              ReauthorizeEvery: 300
+
+  # ============================================================================
+  # LAMBDA FUNCTIONS
+  # ============================================================================
+  
+  # Auth Functions
+  SignUpFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'multi-player-signup-${Environment}'
+      CodeUri: src/functions/auth/signup
+      Handler: app.lambda_handler
+      Layers:
+        - !Ref CommonLayer
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CompetitionTable
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - cognito-idp:AdminCreateUser
+                - cognito-idp:AdminSetUserPassword
+              Resource: !GetAtt UserPool.Arn
+      Environment:
+        Variables:
+          USER_POOL_ID: !Ref UserPool
+      Events:
+        SignUpApi:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref ApiGateway
+            Path: /api/auth/signup
+            Method: post
+
+  SignInFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'multi-player-signin-${Environment}'
+      CodeUri: src/functions/auth/signin
+      Handler: app.lambda_handler
+      Layers:
+        - !Ref CommonLayer
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - cognito-idp:InitiateAuth
+              Resource: !GetAtt UserPool.Arn
+      Environment:
+        Variables:
+          USER_POOL_ID: !Ref UserPool
+          CLIENT_ID: !Ref UserPoolClient
+      Events:
+        SignInApi:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref ApiGateway
+            Path: /api/auth/signin
+            Method: post
+
+  # League Functions
+  CreateLeagueFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'multi-player-create-league-${Environment}'
+      CodeUri: src/functions/leagues/create
+      Handler: app.lambda_handler
+      Layers:
+        - !Ref CommonLayer
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CompetitionTable
+      Events:
+        CreateLeagueApi:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref ApiGateway
+            Path: /api/leagues
+            Method: post
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  ListLeaguesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'multi-player-list-leagues-${Environment}'
+      CodeUri: src/functions/leagues/list
+      Handler: app.lambda_handler
+      Layers:
+        - !Ref CommonLayer
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref CompetitionTable
+      Events:
+        ListLeaguesApi:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref ApiGateway
+            Path: /api/leagues
+            Method: get
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  GetLeagueFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'multi-player-get-league-${Environment}'
+      CodeUri: src/functions/leagues/get
+      Handler: app.lambda_handler
+      Layers:
+        - !Ref CommonLayer
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref CompetitionTable
+      Events:
+        GetLeagueApi:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref ApiGateway
+            Path: /api/leagues/{leagueId}
+            Method: get
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  # User Functions
+  GetUserProfileFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'multi-player-get-profile-${Environment}'
+      CodeUri: src/functions/users/profile
+      Handler: app.lambda_handler
+      Layers:
+        - !Ref CommonLayer
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref CompetitionTable
+      Events:
+        GetProfileApi:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref ApiGateway
+            Path: /api/users/profile
+            Method: get
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  # League Member Functions
+  ListLeagueMembersFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'multi-player-list-league-members-${Environment}'
+      CodeUri: src/functions/leagues/members/list
+      Handler: app.lambda_handler
+      Layers:
+        - !Ref CommonLayer
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref CompetitionTable
+      Events:
+        ListLeagueMembersApi:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref ApiGateway
+            Path: /api/leagues/{leagueId}/members
+            Method: get
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  # Game Functions
+  CreateGameFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'multi-player-create-game-${Environment}'
+      CodeUri: src/functions/games/create
+      Handler: app.lambda_handler
+      Layers:
+        - !Ref CommonLayer
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CompetitionTable
+      Events:
+        CreateGameApi:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref ApiGateway
+            Path: /api/leagues/{leagueId}/games
+            Method: post
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  # Prediction Functions
+  SubmitPredictionFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'multi-player-submit-prediction-${Environment}'
+      CodeUri: src/functions/predictions/submit
+      Handler: app.lambda_handler
+      Layers:
+        - !Ref CommonLayer
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CompetitionTable
+      Events:
+        SubmitPredictionApi:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref ApiGateway
+            Path: /api/rounds/{roundId}/predictions
+            Method: post
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  # Round Functions
+  CreateRoundFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'multi-player-create-round-${Environment}'
+      CodeUri: src/functions/rounds/create
+      Handler: app.lambda_handler
+      Layers:
+        - !Ref CommonLayer
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CompetitionTable
+      Events:
+        CreateRoundApi:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref ApiGateway
+            Path: /api/games/{gameId}/rounds
+            Method: post
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  ScoreRoundFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'multi-player-score-round-${Environment}'
+      CodeUri: src/functions/rounds/score
+      Handler: app.lambda_handler
+      Layers:
+        - !Ref CommonLayer
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CompetitionTable
+      Timeout: 300
+      MemorySize: 1024
+      Events:
+        ScoreRoundScheduled:
+          Type: Schedule
+          Properties:
+            Schedule: cron(0 2 * * ? *)
+            Description: Score completed rounds daily at 2 AM UTC
+
+  # Standings Functions
+  GetStandingsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'multi-player-get-standings-${Environment}'
+      CodeUri: src/functions/standings/get
+      Handler: app.lambda_handler
+      Layers:
+        - !Ref CommonLayer
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref CompetitionTable
+      Events:
+        GetStandingsApi:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref ApiGateway
+            Path: /api/standings/{standingsId}
+            Method: get
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  # ============================================================================
+  # S3 BUCKET FOR FRONTEND (Private)
+  # ============================================================================
+  
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'multi-player-frontend-${Environment}-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ============================================================================
+  # CLOUDFRONT ORIGIN ACCESS CONTROL
+  # ============================================================================
+  
+  CloudFrontOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub 'multi-player-oac-${Environment}'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # ============================================================================
+  # S3 BUCKET POLICY (Allow CloudFront OAC)
+  # ============================================================================
+  
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${FrontendBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}'
+
+  # ============================================================================
+  # CLOUDFRONT DISTRIBUTION
+  # ============================================================================
+  
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        HttpVersion: http2and3
+        DefaultRootObject: index.html
+        Comment: !Sub 'Multi-Player Frontend - ${Environment}'
+        Origins:
+          # S3 Origin for frontend assets
+          - Id: S3Origin
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            S3OriginConfig: {}
+            OriginAccessControlId: !Ref CloudFrontOAC
+          # API Gateway Origin
+          - Id: ApiOrigin
+            DomainName: !Sub '${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com'
+            CustomOriginConfig:
+              HTTPPort: 80
+              HTTPSPort: 443
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols:
+                - TLSv1.2
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+          Compress: true
+        CacheBehaviors:
+          # API routes
+          - PathPattern: /api/*
+            TargetOriginId: ApiOrigin
+            ViewerProtocolPolicy: https-only
+            AllowedMethods:
+              - GET
+              - HEAD
+              - OPTIONS
+              - PUT
+              - POST
+              - PATCH
+              - DELETE
+            CachePolicyId: 4135ea3d-c35d-46eb-81d7-c35d46eb81d7
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+        CustomErrorResponses:
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 0
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 0
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+        Logging:
+          Bucket: !GetAtt CloudFrontLogsBucket.DomainName
+          Prefix: cloudfront-logs/
+          IncludeCookies: false
+
+  CloudFrontLogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'multi-player-cf-logs-${Environment}-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: 90
+
+  # ============================================================================
+  # OUTPUTS
+  # ============================================================================
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub 'https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiEndpoint'
+
+  CloudFrontDomain:
+    Description: CloudFront distribution domain name
+    Value: !GetAtt CloudFrontDistribution.DomainName
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudFrontDomain'
+
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref UserPool
+    Export:
+      Name: !Sub '${AWS::StackName}-UserPoolId'
+
+  UserPoolClientId:
+    Description: Cognito User Pool Client ID
+    Value: !Ref UserPoolClient
+    Export:
+      Name: !Sub '${AWS::StackName}-UserPoolClientId'
+
+  IdentityPoolId:
+    Description: Cognito Identity Pool ID
+    Value: !Ref IdentityPool
+    Export:
+      Name: !Sub '${AWS::StackName}-IdentityPoolId'
+
+  TableName:
+    Description: DynamoDB Table Name
+    Value: !Ref CompetitionTable
+    Export:
+      Name: !Sub '${AWS::StackName}-TableName'
+
+  FrontendBucketName:
+    Description: S3 bucket for frontend assets
+    Value: !Ref FrontendBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-FrontendBucket'
