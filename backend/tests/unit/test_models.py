@@ -3,8 +3,8 @@ import pytest
 from datetime import datetime
 from pydantic import ValidationError
 
-from models.base import BaseEntity
-from models.user import (
+from python.models.base import BaseEntity
+from python.models.user import (
     UserProfile, UserPreferences, UserSettings, UserStatistics,
     AccountStatus, ProfileVisibility, ThemePreference, NotificationFrequency, GameType,
     UserProfileResponse, UserStatisticsResponse
@@ -333,7 +333,7 @@ class TestUserSettings:
     
     def test_user_settings_with_2fa(self, user_id):
         """Test UserSettings with 2FA enabled."""
-        from models.user import TwoFactorMethod
+        from python.models.user import TwoFactorMethod
         
         settings = UserSettings(
             pk=f'USER#{user_id}',

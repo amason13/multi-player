@@ -2,21 +2,24 @@
 import pytest
 from datetime import datetime
 from unittest.mock import Mock, MagicMock, patch, call
-from moto import mock_dynamodb
+from moto import mock_aws
 import boto3
 
-from repository.table import DynamoDBTable
-from repository.user import UserRepository
-from models.user import (
+from python.repository.table import DynamoDBTable
+from python.repository.user import UserRepository
+from python.models.user import (
     UserProfile, UserPreferences, UserSettings, UserStatistics,
     AccountStatus, GameType
 )
+
+# Alias for compatibility
+mock_dynamodb = mock_aws
 
 
 class TestDynamoDBTable:
     """Test cases for DynamoDBTable wrapper."""
     
-    @mock_dynamodb
+    @mock_aws
     def test_dynamodb_table_initialization(self):
         """Test DynamoDBTable initialization."""
         with patch.dict('os.environ', {'TABLE_NAME': 'test-table'}):

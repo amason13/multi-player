@@ -8,20 +8,27 @@ from unittest.mock import Mock, MagicMock, patch
 
 import pytest
 import boto3
-from moto import mock_dynamodb, mock_cognito_idp
+from moto import mock_aws
 from pydantic import ValidationError
 
-# Add src to path for imports
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../src/layers/common/python'))
+# Add src to path for imports - use common layer as package root
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../src/layers/common'))
 
-from models.user import (
+# Add src directory to path for function imports
+src_path = os.path.join(os.path.dirname(__file__), '../src')
+sys.path.insert(0, src_path)
+
+# Add functions directory to path
+functions_path = os.path.join(os.path.dirname(__file__), '../src/functions')
+sys.path.insert(0, functions_path)
+
+from python.models.user import (
     UserProfile, UserPreferences, UserSettings, UserStatistics,
     AccountStatus, ProfileVisibility, ThemePreference, NotificationFrequency, GameType
 )
-from repository.table import DynamoDBTable
-from repository.user import UserRepository
-from utils.exceptions import ValidationError as AppValidationError
-from utils.responses import success_response, error_response
+from python.repository import DynamoDBTable, UserRepository
+from python.utils.exceptions import ValidationError as AppValidationError
+from python.utils.responses import success_response, error_response
 
 
 # ============================================================================
@@ -46,7 +53,7 @@ def setup_test_env():
 @pytest.fixture
 def dynamodb_table():
     """Create a mock DynamoDB table for testing."""
-    with mock_dynamodb():
+    with mock_aws():
         dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
         
         # Create test table
@@ -86,7 +93,7 @@ def dynamodb_table():
 def dynamodb_table_wrapper(dynamodb_table):
     """Create a DynamoDBTable wrapper for testing."""
     with patch.dict(os.environ, {'TABLE_NAME': 'test-table'}):
-        with mock_dynamodb():
+        with mock_aws():
             dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
             table = dynamodb.create_table(
                 TableName='test-table',
